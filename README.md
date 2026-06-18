@@ -1,2 +1,3 @@
-# OPENCV_LineFind
-一个opencv的直线查找算子demo
+# OPENCV_LineFindDemo
+
+一个 OpenCV 的直线查找算子 Demo
