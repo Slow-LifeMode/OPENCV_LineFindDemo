@@ -15,7 +15,7 @@ namespace OpenCvWindowTool
         /// 使用源图像执行直线检测，调用方没有缓存上下文时使用。
         /// </summary>
         /// <param name="image">源图像。</param>
-        /// <param name="roi">检测ROI。</param>
+        /// <param name="roi">检测 ROI。</param>
         /// <param name="parameters">检测参数。</param>
         /// <returns>直线检测结果。</returns>
         public LineDetectionResult Detect(Mat image, RoiItem roi, LineDetectionParams parameters)
@@ -30,13 +30,13 @@ namespace OpenCvWindowTool
         /// 使用预处理图像上下文执行直线检测。
         /// </summary>
         /// <param name="context">直线检测图像上下文。</param>
-        /// <param name="roi">检测ROI。</param>
+        /// <param name="roi">检测 ROI。</param>
         /// <param name="parameters">检测参数。</param>
         /// <returns>直线检测结果。</returns>
         public LineDetectionResult Detect(LineDetectionImageContext context, RoiItem roi, LineDetectionParams parameters)
         {
             LineDetectionParams actualParams = NormalizeParams(parameters);
-            if (context == null || context.GrayPixels == null || context.Width <= 0 || context.Height <= 0)
+            if (context == null || context.GrayImage == null || context.GrayImage.Empty() || context.Width <= 0 || context.Height <= 0)
             {
                 return LineDetectionResult.CreateFailure("当前没有可检测的图像。", default(LineDetectionFrame), actualParams.ScanDirection);
             }
@@ -60,7 +60,7 @@ namespace OpenCvWindowTool
                 return LineDetectionResult.CreateFailure("有效检测点不足，无法拟合直线。", frame, actualParams.ScanDirection, edgePoints, stopwatch.Elapsed);
             }
 
-            PointF[] line = FitLine(frame, actualParams, edgePoints);
+            PointF[] line = FitLine(edgePoints);
             stopwatch.Stop();
             return LineDetectionResult.CreateSuccess(frame, actualParams.ScanDirection, line[0], line[1], edgePoints, stopwatch.Elapsed);
         }
@@ -89,7 +89,7 @@ namespace OpenCvWindowTool
         }
 
         /// <summary>
-        /// 在ROI内按卡尺排列方向采集检测点。
+        /// 在 ROI 内按卡尺排列方向采集检测点。
         /// </summary>
         /// <param name="context">直线检测图像上下文。</param>
         /// <param name="frame">检测测量框。</param>
@@ -97,28 +97,16 @@ namespace OpenCvWindowTool
         /// <returns>检测点集合。</returns>
         private static List<LineEdgePoint> CollectEdgePoints(LineDetectionImageContext context, LineDetectionFrame frame, LineDetectionParams parameters)
         {
-            PointF scanDir = frame.GetScanDirection(parameters.ScanDirection);
-            PointF arrangeDir = frame.GetLineArrangeDirection(parameters.ScanDirection);
-            float arrangeLength = frame.GetArrangeLength(parameters.ScanDirection);
-            float scanLength = frame.GetScanLength(parameters.ScanDirection);
-            float caliperHalfWidth = Math.Max(0.5f, arrangeLength / parameters.SampleCount * 0.5f);
-            float arrangeStart = -arrangeLength / 2f + caliperHalfWidth;
-            float arrangeEnd = arrangeLength / 2f - caliperHalfWidth;
-            float arrangeStep = parameters.SampleCount == 1 ? 0f : (arrangeEnd - arrangeStart) / (parameters.SampleCount - 1);
-            int scanCount = Math.Max(3, (int)Math.Ceiling(scanLength / parameters.SampleStep) + 1);
-            float[] profile = new float[scanCount];
-            float[] smoothed = new float[scanCount];
-            int[] counts = new int[scanCount];
             List<LineEdgePoint> result = new List<LineEdgePoint>(parameters.SampleCount);
+            List<CaliperInfo> calipers = GenerateCalipers(frame, parameters);
 
-            for (int i = 0; i < parameters.SampleCount; i++)
+            foreach (CaliperInfo caliper in calipers)
             {
-                float along = arrangeStart + arrangeStep * i;
-                PointF center = new PointF(frame.Center.X + arrangeDir.X * along, frame.Center.Y + arrangeDir.Y * along);
-                CaliperCandidate candidate = DetectOneCaliper(context, center, scanDir, arrangeDir, scanLength, caliperHalfWidth, parameters, profile, smoothed, counts);
-                if (candidate.IsValid)
+                List<EdgePoint> edges = FindEdgesInCaliper(context.GrayImage, caliper, parameters);
+                EdgePoint selected = SelectPointByTransition(edges, parameters.SelectionMode);
+                if (selected.IsValid)
                 {
-                    result.Add(new LineEdgePoint(candidate.Point, candidate.Strength));
+                    result.Add(new LineEdgePoint(selected.Position, selected.Strength));
                 }
             }
 
@@ -126,337 +114,329 @@ namespace OpenCvWindowTool
         }
 
         /// <summary>
-        /// 在单条卡尺线上检测候选边缘并按参数选择一个检测点。
+        /// 按旧项目卡尺模型在 ROI 中生成等间距卡尺。
         /// </summary>
-        /// <param name="context">直线检测图像上下文。</param>
-        /// <param name="center">卡尺中心点。</param>
-        /// <param name="scanDir">扫描方向。</param>
-        /// <param name="widthDir">卡尺宽度方向。</param>
-        /// <param name="scanLength">扫描长度。</param>
-        /// <param name="halfWidth">卡尺半宽。</param>
+        /// <param name="frame">检测测量框。</param>
         /// <param name="parameters">检测参数。</param>
-        /// <param name="profile">灰度曲线缓存。</param>
-        /// <param name="smoothed">平滑曲线缓存。</param>
-        /// <param name="counts">采样计数缓存。</param>
-        /// <returns>选中的卡尺候选点。</returns>
-        private static CaliperCandidate DetectOneCaliper(LineDetectionImageContext context, PointF center, PointF scanDir, PointF widthDir, float scanLength, float halfWidth, LineDetectionParams parameters, float[] profile, float[] smoothed, int[] counts)
+        /// <returns>卡尺集合。</returns>
+        private static List<CaliperInfo> GenerateCalipers(LineDetectionFrame frame, LineDetectionParams parameters)
         {
-            int scanCount = profile.Length;
-            int widthCount = Math.Max(1, (int)Math.Ceiling((halfWidth * 2f) / parameters.SampleStep));
-            float scanStep = scanLength / Math.Max(1, scanCount - 1);
-            float widthStep = widthCount == 1 ? 0f : (halfWidth * 2f) / (widthCount - 1);
-            float scanStart = -scanLength / 2f;
-            float widthStart = -halfWidth;
+            PointF arrangeDir = frame.GetLineArrangeDirection(parameters.ScanDirection);
+            PointF scanDir = frame.GetScanDirection(parameters.ScanDirection);
+            float arrangeLength = frame.GetArrangeLength(parameters.ScanDirection);
+            float scanLength = frame.GetScanLength(parameters.ScanDirection);
+            float halfArrange = arrangeLength / 2f;
+            PointF segmentStart = new PointF(frame.Center.X - arrangeDir.X * halfArrange, frame.Center.Y - arrangeDir.Y * halfArrange);
+            float spacing = arrangeLength / (parameters.SampleCount + 1f);
+            float caliperWidth = Math.Max(1f, arrangeLength / parameters.SampleCount);
 
-            for (int i = 0; i < scanCount; i++)
+            List<CaliperInfo> calipers = new List<CaliperInfo>(parameters.SampleCount);
+            for (int i = 1; i <= parameters.SampleCount; i++)
             {
-                profile[i] = 0f;
-                smoothed[i] = 0f;
-                counts[i] = 0;
+                float offset = i * spacing;
+                PointF center = new PointF(segmentStart.X + arrangeDir.X * offset, segmentStart.Y + arrangeDir.Y * offset);
+                calipers.Add(new CaliperInfo(center, scanDir, arrangeDir, scanLength, caliperWidth));
             }
 
-            for (int scanIndex = 0; scanIndex < scanCount; scanIndex++)
-            {
-                float scanOffset = scanStart + scanIndex * scanStep;
-                float baseX = center.X + scanDir.X * scanOffset;
-                float baseY = center.Y + scanDir.Y * scanOffset;
-                int sum = 0;
-                int count = 0;
-
-                for (int widthIndex = 0; widthIndex < widthCount; widthIndex++)
-                {
-                    float widthOffset = widthStart + widthIndex * widthStep;
-                    int x = (int)Math.Round(baseX + widthDir.X * widthOffset);
-                    int y = (int)Math.Round(baseY + widthDir.Y * widthOffset);
-                    if (x < 0 || y < 0 || x >= context.Width || y >= context.Height) continue;
-
-                    sum += context.GrayPixels[y * context.Width + x];
-                    count++;
-                }
-
-                if (count > 0)
-                {
-                    profile[scanIndex] = (float)sum / count;
-                    counts[scanIndex] = count;
-                }
-            }
-
-            SmoothProfile(profile, smoothed, counts, parameters.SmoothSize);
-            return SelectCandidate(smoothed, counts, center, scanDir, scanStart, scanStep, parameters);
+            return calipers;
         }
 
         /// <summary>
-        /// 对一维灰度曲线做滑动平均平滑。
+        /// 在单条卡尺中查找满足阈值、极性和局部峰值条件的边缘点。
         /// </summary>
-        /// <param name="source">原始灰度曲线。</param>
-        /// <param name="target">平滑后的灰度曲线。</param>
-        /// <param name="counts">有效采样计数。</param>
-        /// <param name="size">平滑窗口大小。</param>
-        private static void SmoothProfile(float[] source, float[] target, int[] counts, int size)
-        {
-            int length = source.Length;
-            if (size <= 1)
-            {
-                for (int i = 0; i < length; i++) target[i] = source[i];
-                return;
-            }
-
-            int half = size / 2;
-            for (int i = 0; i < length; i++)
-            {
-                float sum = 0f;
-                int count = 0;
-                int start = Math.Max(0, i - half);
-                int end = Math.Min(length - 1, i + half);
-                for (int j = start; j <= end; j++)
-                {
-                    if (counts[j] <= 0) continue;
-                    sum += source[j];
-                    count++;
-                }
-                target[i] = count == 0 ? source[i] : sum / count;
-            }
-        }
-
-        /// <summary>
-        /// 从一维灰度曲线中按极性和选择方式获取候选点。
-        /// </summary>
-        /// <param name="profile">平滑后的灰度曲线。</param>
-        /// <param name="counts">有效采样计数。</param>
-        /// <param name="center">卡尺中心点。</param>
-        /// <param name="scanDir">扫描方向。</param>
-        /// <param name="scanStart">扫描起始偏移。</param>
-        /// <param name="scanStep">扫描步长。</param>
+        /// <param name="grayImage">灰度图像。</param>
+        /// <param name="caliper">卡尺信息。</param>
         /// <param name="parameters">检测参数。</param>
-        /// <returns>选中的候选点。</returns>
-        private static CaliperCandidate SelectCandidate(float[] profile, int[] counts, PointF center, PointF scanDir, float scanStart, float scanStep, LineDetectionParams parameters)
+        /// <returns>候选边缘点集合。</returns>
+        private static List<EdgePoint> FindEdgesInCaliper(Mat grayImage, CaliperInfo caliper, LineDetectionParams parameters)
         {
-            CaliperCandidate selected = CaliperCandidate.Invalid;
-            int length = profile.Length;
-            for (int i = 1; i < length - 1; i++)
+            List<EdgePoint> edges = new List<EdgePoint>();
+            double[] profile = ExtractCaliperProfile(grayImage, caliper);
+            if (profile == null || profile.Length < 2)
             {
-                if (counts[i] <= 0 || counts[i - 1] <= 0 || counts[i + 1] <= 0) continue;
+                return edges;
+            }
 
-                float gradient = (profile[i + 1] - profile[i - 1]) / Math.Max(0.0001f, scanStep * 2f);
-                float strength = Math.Abs(gradient);
-                if (strength < parameters.EdgeThreshold) continue;
-                if (!MatchPolarity(gradient, parameters.EdgePolarity)) continue;
+            double[] gradient = new double[profile.Length];
+            for (int i = 1; i < profile.Length - 1; i++)
+            {
+                gradient[i] = (profile[i + 1] - profile[i - 1]) / 2.0;
+            }
 
-                float prevStrength = Math.Abs((profile[i] - profile[i - 1]) / Math.Max(0.0001f, scanStep));
-                float nextStrength = Math.Abs((profile[i + 1] - profile[i]) / Math.Max(0.0001f, scanStep));
-                if (strength < prevStrength || strength < nextStrength) continue;
-
-                float offset = scanStart + i * scanStep;
-                CaliperCandidate candidate = new CaliperCandidate(
-                    new PointF(center.X + scanDir.X * offset, center.Y + scanDir.Y * offset),
-                    offset,
-                    strength);
-
-                if (!selected.IsValid || IsBetterCandidate(candidate, selected, parameters.SelectionMode))
+            for (int i = 1; i < gradient.Length - 1; i++)
+            {
+                double strength = Math.Abs(gradient[i]);
+                if (strength < parameters.EdgeThreshold)
                 {
-                    selected = candidate;
+                    continue;
+                }
+
+                if (!MatchPolarity(gradient[i], parameters.EdgePolarity))
+                {
+                    continue;
+                }
+
+                if (Math.Abs(gradient[i]) > Math.Abs(gradient[i - 1]) &&
+                    Math.Abs(gradient[i]) > Math.Abs(gradient[i + 1]))
+                {
+                    double offset = (i / (double)profile.Length - 0.5) * caliper.Length;
+                    PointF position = new PointF(
+                        (float)(caliper.Center.X + offset * caliper.Direction.X),
+                        (float)(caliper.Center.Y + offset * caliper.Direction.Y));
+
+                    edges.Add(new EdgePoint(position, (float)strength));
                 }
             }
 
-            return selected;
+            return edges;
         }
 
         /// <summary>
-        /// 判断候选点是否优于当前已选点。
+        /// 将卡尺区域仿射拉正后，沿宽度方向平均得到一维灰度曲线。
         /// </summary>
-        /// <param name="candidate">新的候选点。</param>
-        /// <param name="selected">当前已选点。</param>
-        /// <param name="mode">边缘选择方式。</param>
-        /// <returns>新候选点更优时返回true。</returns>
-        private static bool IsBetterCandidate(CaliperCandidate candidate, CaliperCandidate selected, LineSelectionMode mode)
+        /// <param name="image">灰度图像。</param>
+        /// <param name="caliper">卡尺信息。</param>
+        /// <returns>一维灰度曲线；卡尺尺寸无效时返回 null。</returns>
+        private static double[] ExtractCaliperProfile(Mat image, CaliperInfo caliper)
         {
+            int length = (int)caliper.Length;
+            int width = (int)caliper.Width;
+            if (length <= 0 || width <= 0)
+            {
+                return null;
+            }
+
+            using (Mat transformMatrix = GetCaliperTransformMatrix(caliper, length, width))
+            using (Mat croppedRegion = new Mat())
+            {
+                Cv2.WarpAffine(
+                    image,
+                    croppedRegion,
+                    transformMatrix,
+                    new OpenCvSharp.Size(length, width),
+                    InterpolationFlags.Linear,
+                    BorderTypes.Constant,
+                    Scalar.All(0));
+
+                double[] profile = new double[length];
+                for (int x = 0; x < length; x++)
+                {
+                    double sum = 0d;
+                    int count = 0;
+                    for (int y = 0; y < width; y++)
+                    {
+                        sum += croppedRegion.At<byte>(y, x);
+                        count++;
+                    }
+
+                    profile[x] = count > 0 ? sum / count : 0d;
+                }
+
+                return profile;
+            }
+        }
+
+        /// <summary>
+        /// 计算从原图坐标到卡尺矩形坐标的仿射矩阵。
+        /// </summary>
+        /// <param name="caliper">卡尺信息。</param>
+        /// <param name="length">拉正后卡尺图像长度。</param>
+        /// <param name="width">拉正后卡尺图像宽度。</param>
+        /// <returns>仿射变换矩阵。</returns>
+        private static Mat GetCaliperTransformMatrix(CaliperInfo caliper, int length, int width)
+        {
+            Point2f[] srcPoints = new Point2f[3];
+            srcPoints[0] = new Point2f(0, 0);
+            srcPoints[1] = new Point2f(length - 1, 0);
+            srcPoints[2] = new Point2f(0, width - 1);
+
+            double halfLength = caliper.Length / 2.0;
+            double halfWidth = caliper.Width / 2.0;
+            Point2f[] dstPoints = new Point2f[3];
+            dstPoints[0] = new Point2f(
+                (float)(caliper.Center.X - halfLength * caliper.Direction.X - halfWidth * caliper.Perpendicular.X),
+                (float)(caliper.Center.Y - halfLength * caliper.Direction.Y - halfWidth * caliper.Perpendicular.Y));
+            dstPoints[1] = new Point2f(
+                (float)(caliper.Center.X + halfLength * caliper.Direction.X - halfWidth * caliper.Perpendicular.X),
+                (float)(caliper.Center.Y + halfLength * caliper.Direction.Y - halfWidth * caliper.Perpendicular.Y));
+            dstPoints[2] = new Point2f(
+                (float)(caliper.Center.X - halfLength * caliper.Direction.X + halfWidth * caliper.Perpendicular.X),
+                (float)(caliper.Center.Y - halfLength * caliper.Direction.Y + halfWidth * caliper.Perpendicular.Y));
+
+            return Cv2.GetAffineTransform(dstPoints, srcPoints);
+        }
+
+        /// <summary>
+        /// 按边缘选择模式从单卡尺候选点中选出一个检测点。
+        /// </summary>
+        /// <param name="edges">单卡尺候选边缘点。</param>
+        /// <param name="mode">边缘选择模式。</param>
+        /// <returns>选中的边缘点；没有候选点时返回无效点。</returns>
+        private static EdgePoint SelectPointByTransition(List<EdgePoint> edges, LineSelectionMode mode)
+        {
+            if (edges.Count == 0)
+            {
+                return EdgePoint.Invalid;
+            }
+
             switch (mode)
             {
                 case LineSelectionMode.First:
-                    return candidate.Offset < selected.Offset;
+                    return edges[0];
                 case LineSelectionMode.Last:
-                    return candidate.Offset > selected.Offset;
+                    return edges[edges.Count - 1];
                 default:
-                    return candidate.Strength > selected.Strength;
+                    EdgePoint strongest = edges[0];
+                    for (int i = 1; i < edges.Count; i++)
+                    {
+                        if (edges[i].Strength > strongest.Strength)
+                        {
+                            strongest = edges[i];
+                        }
+                    }
+                    return strongest;
             }
         }
 
         /// <summary>
-        /// 判断梯度方向是否符合边缘极性。
+        /// 判断梯度方向是否符合边缘极性设置。
         /// </summary>
         /// <param name="gradient">灰度梯度。</param>
         /// <param name="polarity">边缘极性。</param>
-        /// <returns>符合极性时返回true。</returns>
-        private static bool MatchPolarity(float gradient, LineEdgePolarity polarity)
+        /// <returns>符合极性时返回 true。</returns>
+        private static bool MatchPolarity(double gradient, LineEdgePolarity polarity)
         {
             switch (polarity)
             {
                 case LineEdgePolarity.Positive:
-                    return gradient > 0f;
+                    return gradient > 0d;
                 case LineEdgePolarity.Negative:
-                    return gradient < 0f;
+                    return gradient < 0d;
                 default:
                     return true;
             }
         }
 
         /// <summary>
-        /// 将检测点拟合为ROI内线段。
+        /// 使用旧项目最小二乘公式将检测点拟合成直线段。
         /// </summary>
-        /// <param name="frame">检测测量框。</param>
-        /// <param name="parameters">检测参数。</param>
         /// <param name="edgePoints">检测点集合。</param>
-        /// <returns>线段起点和终点。</returns>
-        private static PointF[] FitLine(LineDetectionFrame frame, LineDetectionParams parameters, List<LineEdgePoint> edgePoints)
+        /// <returns>拟合线段起点和终点。</returns>
+        private static PointF[] FitLine(List<LineEdgePoint> edgePoints)
         {
-            Point2f[] points = new Point2f[edgePoints.Count];
-            for (int i = 0; i < edgePoints.Count; i++)
+            int n = edgePoints.Count;
+            double sumX = 0d;
+            double sumY = 0d;
+            double sumXY = 0d;
+            double sumX2 = 0d;
+            double sumY2 = 0d;
+            double minX = double.MaxValue;
+            double maxX = double.MinValue;
+            double minY = double.MaxValue;
+            double maxY = double.MinValue;
+
+            foreach (LineEdgePoint edgePoint in edgePoints)
             {
-                points[i] = new Point2f(edgePoints[i].Point.X, edgePoints[i].Point.Y);
+                double x = edgePoint.Point.X;
+                double y = edgePoint.Point.Y;
+                sumX += x;
+                sumY += y;
+                sumXY += x * y;
+                sumX2 += x * x;
+                sumY2 += y * y;
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
             }
 
-            Line2D line = parameters.FitMode == LineFitMode.LeastSquares
-                ? Cv2.FitLine(points, DistanceTypes.L2, 0, 0.01, 0.01)
-                : Cv2.FitLine(points, DistanceTypes.Welsch, 0, 0.01, 0.01);
-
-            PointF direction = new PointF((float)line.Vx, (float)line.Vy);
-            PointF point = new PointF((float)line.X1, (float)line.Y1);
-            PointF arrangeDir = frame.GetLineArrangeDirection(parameters.ScanDirection);
-            if (direction.X * arrangeDir.X + direction.Y * arrangeDir.Y < 0f)
+            double denom = n * sumX2 - sumX * sumX;
+            if (Math.Abs(denom) < 0.0001d)
             {
-                direction = new PointF(-direction.X, -direction.Y);
-            }
-
-            float halfLength = frame.GetArrangeLength(parameters.ScanDirection) / 2f;
-            PointF start = new PointF(point.X - direction.X * halfLength, point.Y - direction.Y * halfLength);
-            PointF end = new PointF(point.X + direction.X * halfLength, point.Y + direction.Y * halfLength);
-            return ClipLineToFrame(point, direction, frame, out PointF clippedStart, out PointF clippedEnd)
-                ? new[] { clippedStart, clippedEnd }
-                : new[] { start, end };
-        }
-
-        /// <summary>
-        /// 将无限直线裁剪到检测测量框内部。
-        /// </summary>
-        /// <param name="point">直线上的点。</param>
-        /// <param name="direction">直线方向。</param>
-        /// <param name="frame">检测测量框。</param>
-        /// <param name="start">裁剪后的起点。</param>
-        /// <param name="end">裁剪后的终点。</param>
-        /// <returns>裁剪成功时返回true。</returns>
-        private static bool ClipLineToFrame(PointF point, PointF direction, LineDetectionFrame frame, out PointF start, out PointF end)
-        {
-            start = PointF.Empty;
-            end = PointF.Empty;
-            PointF[] corners = frame.GetCorners();
-            List<PointF> intersections = new List<PointF>(4);
-
-            for (int i = 0; i < corners.Length; i++)
-            {
-                PointF a = corners[i];
-                PointF b = corners[(i + 1) % corners.Length];
-                if (TryIntersectInfiniteLineWithSegment(point, direction, a, b, out PointF intersection))
+                double verticalDenom = n * sumY2 - sumY * sumY;
+                if (Math.Abs(verticalDenom) < 0.0001d)
                 {
-                    AddUniquePoint(intersections, intersection);
+                    PointF point = edgePoints[0].Point;
+                    return new[] { point, point };
                 }
-            }
 
-            if (intersections.Count < 2) return false;
-
-            float maxDistance = float.NegativeInfinity;
-            for (int i = 0; i < intersections.Count - 1; i++)
-            {
-                for (int j = i + 1; j < intersections.Count; j++)
+                double m = (n * sumXY - sumX * sumY) / verticalDenom;
+                double b = (sumX - m * sumY) / n;
+                return new[]
                 {
-                    float dx = intersections[i].X - intersections[j].X;
-                    float dy = intersections[i].Y - intersections[j].Y;
-                    float distance = dx * dx + dy * dy;
-                    if (distance > maxDistance)
-                    {
-                        maxDistance = distance;
-                        start = intersections[i];
-                        end = intersections[j];
-                    }
-                }
+                    new PointF((float)(m * minY + b), (float)minY),
+                    new PointF((float)(m * maxY + b), (float)maxY)
+                };
             }
 
-            return maxDistance > 0.0001f;
-        }
-
-        /// <summary>
-        /// 计算无限直线和线段的交点。
-        /// </summary>
-        /// <param name="linePoint">直线上的点。</param>
-        /// <param name="lineDirection">直线方向。</param>
-        /// <param name="segStart">线段起点。</param>
-        /// <param name="segEnd">线段终点。</param>
-        /// <param name="intersection">交点。</param>
-        /// <returns>存在有效交点时返回true。</returns>
-        private static bool TryIntersectInfiniteLineWithSegment(PointF linePoint, PointF lineDirection, PointF segStart, PointF segEnd, out PointF intersection)
-        {
-            intersection = PointF.Empty;
-            PointF segmentDirection = new PointF(segEnd.X - segStart.X, segEnd.Y - segStart.Y);
-            float denominator = lineDirection.X * segmentDirection.Y - lineDirection.Y * segmentDirection.X;
-            if (Math.Abs(denominator) < 0.0001f) return false;
-
-            PointF delta = new PointF(segStart.X - linePoint.X, segStart.Y - linePoint.Y);
-            float u = (delta.X * lineDirection.Y - delta.Y * lineDirection.X) / denominator;
-            if (u < -0.0001f || u > 1.0001f) return false;
-
-            intersection = new PointF(segStart.X + segmentDirection.X * u, segStart.Y + segmentDirection.Y * u);
-            return true;
-        }
-
-        /// <summary>
-        /// 向点集合中添加非重复点。
-        /// </summary>
-        /// <param name="points">点集合。</param>
-        /// <param name="point">待添加点。</param>
-        private static void AddUniquePoint(List<PointF> points, PointF point)
-        {
-            foreach (PointF existing in points)
+            double slope = (n * sumXY - sumX * sumY) / denom;
+            double intercept = (sumY - slope * sumX) / n;
+            return new[]
             {
-                float dx = existing.X - point.X;
-                float dy = existing.Y - point.Y;
-                if (dx * dx + dy * dy < 0.01f) return;
-            }
-            points.Add(point);
+                new PointF((float)minX, (float)(slope * minX + intercept)),
+                new PointF((float)maxX, (float)(slope * maxX + intercept))
+            };
         }
 
         /// <summary>
-        /// 表示卡尺线上的候选边缘点。
+        /// 保存单条卡尺的几何参数。
         /// </summary>
-        private struct CaliperCandidate
+        private struct CaliperInfo
         {
-            public static readonly CaliperCandidate Invalid = new CaliperCandidate(PointF.Empty, 0f, 0f, false);
+            public readonly PointF Center;
+            public readonly PointF Direction;
+            public readonly PointF Perpendicular;
+            public readonly float Length;
+            public readonly float Width;
 
-            public readonly PointF Point;
-            public readonly float Offset;
+            /// <summary>
+            /// 初始化单条卡尺的几何参数。
+            /// </summary>
+            /// <param name="center">卡尺中心点。</param>
+            /// <param name="direction">卡尺搜索方向。</param>
+            /// <param name="perpendicular">卡尺宽度方向。</param>
+            /// <param name="length">卡尺搜索长度。</param>
+            /// <param name="width">卡尺宽度。</param>
+            public CaliperInfo(PointF center, PointF direction, PointF perpendicular, float length, float width)
+            {
+                Center = center;
+                Direction = direction;
+                Perpendicular = perpendicular;
+                Length = length;
+                Width = width;
+            }
+        }
+
+        /// <summary>
+        /// 保存单条卡尺中的候选边缘点。
+        /// </summary>
+        private struct EdgePoint
+        {
+            public static readonly EdgePoint Invalid = new EdgePoint(PointF.Empty, 0f, false);
+
+            public readonly PointF Position;
             public readonly float Strength;
             public readonly bool IsValid;
 
             /// <summary>
-            /// 初始化候选边缘点。
+            /// 初始化有效候选边缘点。
             /// </summary>
-            /// <param name="point">候选点坐标。</param>
-            /// <param name="offset">扫描方向偏移。</param>
+            /// <param name="position">候选点坐标。</param>
             /// <param name="strength">边缘强度。</param>
-            public CaliperCandidate(PointF point, float offset, float strength)
-                : this(point, offset, strength, true)
+            public EdgePoint(PointF position, float strength)
+                : this(position, strength, true)
             {
             }
 
             /// <summary>
             /// 初始化候选边缘点。
             /// </summary>
-            /// <param name="point">候选点坐标。</param>
-            /// <param name="offset">扫描方向偏移。</param>
+            /// <param name="position">候选点坐标。</param>
             /// <param name="strength">边缘强度。</param>
             /// <param name="isValid">候选点是否有效。</param>
-            private CaliperCandidate(PointF point, float offset, float strength, bool isValid)
+            private EdgePoint(PointF position, float strength, bool isValid)
             {
-                Point = point;
-                Offset = offset;
+                Position = position;
                 Strength = strength;
                 IsValid = isValid;
             }
